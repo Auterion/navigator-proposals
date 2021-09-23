@@ -17,4 +17,13 @@ class VehicleState {
 - params
 
 */
+public:
+    /**
+     * Updates all fields in this vehicle state
+     * Object by copying from the uORB topics
+     */
+    void update() {
+
+    }
+
 };
