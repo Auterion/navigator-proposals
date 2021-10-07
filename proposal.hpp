@@ -14,8 +14,18 @@ namespace util {
 	}
 };
 
+enum class FlightModeSelectionResult {
+	KEPT_CURRENT,
+	SWITCHED,
+	SWITCHED_DIFFERENT_COMMANDER_MODE,
+	MISSION_ITEM_DONE,
+	SWITCHED_FAIL_SAFE_MODE
+};
 
-
+enum class VehicleConfiguration {
+	MULTICOPTER = 0,
+	FIXEDWING
+};
 
 class VehicleState {
 
@@ -43,6 +53,17 @@ public:
 
     }
 
+    bool sticksAvailable() { return _sticks_available; }
+
+    VehicleConfiguration getVehicleConfiguration() const { return _vehicle_configuration; }
+
+private:
+
+    bool _sticks_available{false};
+
+    VehicleConfiguration _vehicle_configuration{VehicleConfiguration::MULTICOPTER};
+
+
 };
 
 
@@ -69,20 +90,20 @@ public:
 	using IdType = uint32_t;
 
     /**
-     * Each FlightMode is supposed to have its own specific ID. 
+     * Each FlightMode is supposed to have its own specific ID.
      * This function is provided such that flight modes can generate
      * a compile-time integer ID from their name
      */
 	template<size_t N>
 	static constexpr uint32_t ID(const char (&name)[N])
 	{
-		return (0xffffff & util::hash_32_fnv1a_const(name))
+		return (0xffffff & util::hash_32_fnv1a_const(name));
 	}
 
     /**
      * Each FlightMode should have a MODE_ID static public field. This function
-     * should get overridden to report back this field. 
-     * @return IdType 
+     * should get overridden to report back this field.
+     * @return IdType
      */
 	virtual IdType getModeId() const = 0;
 
@@ -92,12 +113,12 @@ public:
      * as ell as the time that has elapsed since the last time this function
      * was executed. The vehicle state also contains stick positions, so the flight mode
      * can also react to stick movements. The function is supposed to use some sort
-     * of trajectory planning and to return set points for the controllers. 
-     * @param vehicle_state 
-     * @param delta_time 
-     * @return Setpoints 
+     * of trajectory planning and to return set points for the controllers.
+     * @param vehicle_state
+     * @param delta_time
+     * @return Setpoints
      */
-    virtual Setpoints generateSetpoints(const VehicleState &vehicle_state, float delta_time) = 0; 
+    virtual Setpoints generateSetpoints(const VehicleState &vehicle_state, float delta_time) = 0;
 
 };
 
@@ -229,15 +250,102 @@ public:
     }
 };
 
+class FlightModeSwitcher {
+private:
+	void *_flight_modes_address;
+public:
+	FlightModeSwitcher(void * flight_modes_address) : _flight_modes_address(flight_modes_address) {};
+
+	template<class T, class ... Args>
+	bool switchMode(Args && ... args) {
+		if (_flight_modes_address != nullptr) {
+			if (static_cast<FlightMode*>(_flight_modes_address)->getModeId() == T::MODE_ID) {
+				return false;
+			}
+			static_cast<FlightMode*>(_flight_modes_address)->~FlightMode();
+		}
+		new (_flight_modes_address) T;//T{Args ... args};
+		return true;
+	}
+};
+
+class Vehicle {
+private:
+	VehicleState _state{};
+
+
+protected:
+
+    /**
+     * returns the vehicles current state. This object should include
+     * all information to decide whether a FlightMode can execute or not,
+     * and to actually generate setpoints for executing it.
+     */
+	const VehicleState& getState() const {
+		return _state;
+	}
+
+public:
+    /*
+     * For each commander state / action as well as for each item in a mission, there
+     * is an overwritable function in the vehicle. The function takes the current state
+     * of the vehicle, the intention from user or mission, and selects an appropriate
+     * flight mode to execute that. A flight mode should only ever be chosen if it can
+     * run. It is also expected that these functions / flight modes check geofence,
+     * object avoidance themselves as part of their canRun functions.
+     */
+
+
+	virtual FlightModeSelectionResult modeForCommanderLoiter(
+		const FlightMode &current_flight_mode,
+		FlightModeSwitcher &switcher
+	) = 0;
+
+	virtual FlightModeSelectionResult modeForCommanderAltCtl(
+		const FlightMode& currentMode,
+		FlightModeSwitcher &switcher
+	) = 0;
+
+
+    /*
+     * After selection of a flight mode using the above functions,
+     * This function is executed to check if the vehicle itself
+     * has any fail safe states, such as battery emergencies.
+     * If this is the case, this function shall assign a flight
+     * mode that reacts to that.
+     */
+ 	virtual FlightModeSelectionResult checkVehicleFailsafe(
+		const FlightMode &current_flight_mode,
+		FlightModeSwitcher &switcher
+	) = 0;
+
+    /*
+     * Update the vehicle state by reading from the uORB messages
+     */
+    void updateState() {
+        _state.update();
+    }
+
+	// more overwritable functions, one for each possible commander state / action + mission item
+};
+
+
 
 union FlightModeUnion {
 	FWOrbitFlightMode fw_orbit_flight_mode;
 	MCPosControlFlightMode mc_pos_control_flight_mode;
 	MCAltControlFlightMode mc_alt_control_flight_mode;
+
+	FlightModeUnion() {}
 };
 
 
 class FlightModeManager {
+
+public:
+	FlightModeManager(Vehicle& vehicle) :
+	_vehicle(vehicle),
+	_flight_mode_switcher(&_current_flight_mode_memory) {};
 
 private:
 	// State
@@ -246,8 +354,6 @@ private:
 	FlightModeUnion _current_flight_mode_memory;
 	FlightMode* _current_flight_mode{reinterpret_cast<FlightMode*>(&_current_flight_mode_memory)};
 	FlightModeSwitcher _flight_mode_switcher;
-
-	FlightModeManager() : _flight_mode_switcher(&_current_flight_mode_memory) {};
 
 	/**
 	 * @brief Function that gets executed ~20Hz.
@@ -273,107 +379,10 @@ private:
 	}
 };
 
-
-enum class FlightModeSelectionResult {
-	KEPT_CURRENT,
-	SWITCHED,
-	SWITCHED_DIFFERENT_COMMANDER_MODE,
-	MISSION_ITEM_DONE,
-	SWITCHED_FAIL_SAFE_MODE
-};
-
-
-class FlightModeSwitcher {
-private:
-	void *_flight_modes_address;
-public:
-	FlightModeSwitcher(void * flight_modes_address) : _flight_modes_address(flight_modes_address) {};
-
-	template<class T, class ... Args>
-	bool switchMode(Args && ... args) {
-		if (_flight_modes_address != nullptr) {
-			if (static_cast<FlightMode*>(_flight_modes_address)->getModeId() == T::MODE_ID) {
-				return false;
-			}
-			static_cast<FlightMode*>(_flight_modes_address)->~FlightMode();
-		}
-		new (_flight_modes_address) T{...args};
-		return true;
-	}
-};
-
-
-
-
-
-
-class Vehicle {
-private:
-	VehicleState _state{};
-
-
-protected:
-
-    /**
-     * returns the vehicles current state. This object should include
-     * all information to decide whether a FlightMode can execute or not, 
-     * and to actually generate setpoints for executing it. 
-     */
-	const VehicleState& getState() const {
-		return _state;
-	}
-
-public:
-    /*
-     * For each commander state / action as well as for each item in a mission, there
-     * is an overwritable function in the vehicle. The function takes the current state
-     * of the vehicle, the intention from user or mission, and selects an appropriate 
-     * flight mode to execute that. A flight mode should only ever be chosen if it can
-     * run. It is also expected that these functions / flight modes check geofence, 
-     * object avoidance themselves as part of their canRun functions.
-     */
-
-
-	virtual FlightModeSelectionResult modeForCommanderLoiter(
-		const FlightMode &current_flight_mode,
-		FlightModeSwitcher &switcher
-	) = 0;
-
-	virtual FlightModeSelectionResult modeForCommanderAltCtl(
-		const FlightMode& currentMode,
-		FlightModeSwitcher &switcher
-	) = 0;
-
-
-    /*
-     * After selection of a flight mode using the above functions,
-     * This function is executed to check if the vehicle itself
-     * has any fail safe states, such as battery emergencies. 
-     * If this is the case, this function shall assign a flight
-     * mode that reacts to that. 
-     */
- 	virtual FlightModeSelectionResult checkVehicleFailsafe(
-		const FlightMode &current_flight_mode,
-		FlightModeSwitcher &switcher
-	) = 0;
-
-    /*
-     * Update the vehicle state by reading from the uORB messages 
-     */
-    void updateState() {
-        _state.update();
-    }
-
-	// more overwritable functions, one for each possible commander state / action + mission item
-};
-
-
-
-
 class StandardTiltrotor : public Vehicle {
 
 	virtual FlightModeSelectionResult modeForCommanderLoiter(const FlightMode &current_flight_mode, FlightModeSwitcher &switcher) {
-		if (getState().vtol_configuration == VTOL_CONFIG::MULTICOPTER) {
+		if (getState().getVehicleConfiguration() == VehicleConfiguration::MULTICOPTER) {
 			if (MCPosControlFlightMode::canRun(getState())) {
 				bool switched = switcher.switchMode<MCPosControlFlightMode>(getState());
 				return switched ? FlightModeSelectionResult::SWITCHED : FlightModeSelectionResult::KEPT_CURRENT;
@@ -394,6 +403,11 @@ class StandardTiltrotor : public Vehicle {
 	virtual FlightModeSelectionResult modeForCommanderAltCtl(const FlightMode &current_flight_mode, FlightModeSwitcher &switcher) {
 		//..
 	}
+
+	virtual FlightModeSelectionResult checkVehicleFailsafe(
+		const FlightMode &current_flight_mode,
+		FlightModeSwitcher &switcher
+	) { return FlightModeSelectionResult::KEPT_CURRENT; }
 
 };
 
